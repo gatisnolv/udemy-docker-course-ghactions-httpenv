@@ -1,3 +1,6 @@
+# Description
+This is my fork of https://github.com/BretFisher/httpenv for the Udemy course https://www.udemy.com/course/docker-mastery GitHub Actions automation part learning purposes. These examples are from Bret's repository https://github.com/BretFisher/docker-ci-automation, which also contains a link to video walkthrough for these.
+
 # httpenv
 Tiny HTTP server showing the environment variables on TCP 8888.
 
