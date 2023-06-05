@@ -1,5 +1,5 @@
 ---
-name: 10 Build and Smoke Test
+name: 99 Parallelize Jobs
 
 on:
   push:
@@ -8,20 +8,15 @@ on:
   pull_request:
 
 jobs:
-  build-image:
-    name: Build Images
+# FIRST JOB #######################################################################   
+  build-test-image:
+    name: Build Image for Testing
     runs-on: ubuntu-latest
 
     permissions:
       packages: write # needed to push docker image to ghcr.io
 
     steps:
-
-      - name: Checkout git repo
-        uses: actions/checkout@v3
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v2
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v2
@@ -32,7 +27,6 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-#NEW: (START) ############################################################
       - name: Login to ghcr.io registry
         uses: docker/login-action@v2
         with:
@@ -48,7 +42,89 @@ jobs:
           # target: test # in Bret's examples this refers to a stage in his multi-stage dockerfile he has in his example repo, where as the one here is simple (not a multi-stage dockerfile)
           cache-from: type=gha
           # cache-to: type=gha,mode=max # avoid writing this (single arch amd64 image) to GitHub Actions cache, overwriting the previous entry (the multi arch image from the 'Docker Build and Push to Docker Hub' step) from a prior run of the workflow, because then in the 'Docker Build and Push to Docker Hub' step both arm 64 and 32 bit images (parts of the multi arch image that the step produces) need to be rebuilt instead of being taken from the GitHub Actions cache. The amd64 image built in the 'Build and export to Docker' step is available and doesn't need to be rebuilt in the 'Docker Build and Push to Docker Hub' step thanks to the Docker build cache (both steps use the same builder and are part of a single job/ run on the same runner).
+          cache-to: type=registry,ref=${{ vars.GHCR_REPO }}:buildcache,mode=max # Export the build cache to a registry. Can use the same registry as for the image which would be used for the actual app, using a special tag to disambiguate it from the actual app images. https://github.com/moby/buildkit#registry-push-image-and-cache-separately
           platforms: linux/amd64
+    
+ # NEXT JOB #######################################################################   
+  test-unit:
+    name: Unit tests in Docker
+    needs: [build-test-image]
+    runs-on: ubuntu-latest
+
+    permissions:
+      packages: read
+      
+    steps:
+      
+      - name: Login to ghcr.io registry
+        uses: docker/login-action@v2
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Unit Testing in Docker
+        run: docker run --rm ${{ vars.GHCR_REPO }}:"$GITHUB_RUN_ID" echo "run test commands here"
+
+# NEXT JOB #######################################################################   
+  test-integration:
+    name: Integration tests in Compose
+    needs: [build-test-image]
+    runs-on: ubuntu-latest
+
+    permissions:
+      packages: read
+
+    steps:
+
+      - name: Checkout git repo
+        uses: actions/checkout@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      
+      - name: Login to ghcr.io registry
+        uses: docker/login-action@v2
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Test healthcheck in Docker Compose
+        run: |
+          export TESTING_IMAGE=${{ vars.GHCR_REPO }}:"$GITHUB_RUN_ID"
+          echo Testing image: "$TESTING_IMAGE"
+          docker compose -f docker-compose.test.yml up --exit-code-from sut
+
+# NEXT JOB #######################################################################   
+  test-k3d:
+    name: Test Deployment in Kubernetes
+    needs: [build-test-image]
+    runs-on: ubuntu-latest
+
+    permissions:
+      packages: read
+
+    steps:
+
+      - name: Checkout git repo
+        uses: actions/checkout@v3
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      
+      - name: Login to ghcr.io registry
+        uses: docker/login-action@v2
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - uses: AbsaOSS/k3d-action@v2
         with:
@@ -68,7 +144,94 @@ jobs:
           envsubst < manifests/deployment.yaml  | kubectl apply -f -
           kubectl rollout status deployment myapp
           kubectl exec deploy/myapp -- curl --fail localhost:8888
-#NEW: (END) ############################################################  
+
+# NEXT JOB #######################################################################   
+  scan-image:
+    name: Scan Image with Trivy
+    needs: [build-test-image]
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read # for actions/checkout to fetch code
+      packages: read # needed to pull docker image to ghcr.io
+      security-events: write # for github/codeql-action/upload-sarif to upload SARIF results
+
+    steps:
+
+      - name: Checkout git repo
+        uses: actions/checkout@v3
+      
+      - name: Login to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+          
+      - name: Login to ghcr.io registry
+        uses: docker/login-action@v2
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Pull image to scan
+        run: docker pull ${{ vars.GHCR_REPO }}:"$GITHUB_RUN_ID"
+        
+      - name: Run Trivy for all CVEs (non-blocking)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ vars.GHCR_REPO }}:${{ github.run_id }}
+          format: table
+          exit-code: 0
+
+      # NOTE: disabled to avoid running twice and overwriting 07-add-cve-scanning-adv.yaml
+      # - name: Run Trivy for HIGH,CRITICAL CVEs and report (blocking)
+      #   uses: aquasecurity/trivy-action@master
+      #   with:
+      #     image-ref: ${{ vars.GHCR_REPO }}:${{ github.run_id }}
+      #     exit-code: 1
+      #     ignore-unfixed: true
+      #     vuln-type: 'os,library'
+      #     severity: 'HIGH,CRITICAL'
+      #     format: 'sarif'
+      #     output: 'trivy-results.sarif'
+      
+      # - name: Upload Trivy scan results to GitHub Security tab
+      #   uses: github/codeql-action/upload-sarif@v1
+      #   if: always()
+      #   with:
+      #     sarif_file: 'trivy-results.sarif'
+
+# NEXT JOB #######################################################################   
+  build-final-image:
+    name: Build Final Image
+    needs: [test-unit, test-integration, test-k3d, scan-image]
+    runs-on: ubuntu-latest
+
+    permissions:
+      packages: write # needed to push docker image to ghcr.io
+      pull-requests: write # needed to create and update comments in PRs
+
+    steps:
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Login to ghcr.io registry
+        uses: docker/login-action@v2
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Docker Metadata for Final Image Build
         id: docker_meta
@@ -78,14 +241,21 @@ jobs:
           flavor: |
             latest=false
           tags: |
-            type=raw,value=10
+            type=raw,value=99
           # comment these out on all but 04-add-metadata.yaml to avoid overwriting image tags
           # type=raw,value=latest,enable=${{ endsWith(github.ref, github.event.repository.default_branch) }}
           # type=ref,event=pr
           # type=ref,event=branch
           # type=semver,pattern={{version}}
+
+      - name: Populate build cache with amd64 stuff from first job # only for populating the Docker build cache for the subsequent multi-arch build step to have the amd64 stuff built in the first job (for when the GitHub Actions cache is empty (first run or it's been vacated because of a longer period of inactivity)), since I don't think build-push-action supports multiple cache-from definitions. This works around not having the Docker build cache of the first job automatically available, because this is a separate job/ runs on a different runner. 
+        uses: docker/build-push-action@v4
+        with:
+          push: false
+          cache-from: type=registry,ref=${{ vars.GHCR_REPO }}:buildcache
+          platforms: linux/amd64
       
-      - name: Docker Build and Push to Docker Hub
+      - name: Docker Build and Push to GHCR and Docker Hub
         uses: docker/build-push-action@v4
         with:
           push: true
@@ -94,3 +264,34 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
           platforms: linux/amd64,linux/arm64,linux/arm/v7
+
+        # If PR, put image tags in the PR comments
+        # from https://github.com/marketplace/actions/create-or-update-comment
+        # These are commented out to avoid conflicting with 05-add-comments.yaml example
+      # - name: Find comment for image tags
+      #   uses: peter-evans/find-comment@v1
+      #   if: github.event_name == 'pull_request'
+      #   id: fc
+      #   with:
+      #     issue-number: ${{ github.event.pull_request.number }}
+      #     comment-author: 'github-actions[bot]'
+      #     body-includes: Docker image tag(s) pushed
+      
+      #   # If PR, put image tags in the PR comments
+      # - name: Create or update comment for image tags
+      #   uses: peter-evans/create-or-update-comment@v1
+      #   if: github.event_name == 'pull_request'
+      #   with:
+      #     comment-id: ${{ steps.fc.outputs.comment-id }}
+      #     issue-number: ${{ github.event.pull_request.number }}
+      #     body: |
+      #       Docker image tag(s) pushed:
+      #       ```text
+      #       ${{ steps.docker_meta.outputs.tags }}
+      #       ```
+
+      #       Labels added to images:
+      #       ```text
+      #       ${{ steps.docker_meta.outputs.labels }}
+      #       ```
+      #     edit-mode: replace
