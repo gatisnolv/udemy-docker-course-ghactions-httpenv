@@ -1,5 +1,5 @@
 ---
-name: 08 Build and Unit Test
+name: 09 Build and Integration Test
 
 on:
   push:
@@ -11,8 +11,11 @@ jobs:
   build-image:
     name: Build Images
     runs-on: ubuntu-latest
+
     steps:
 
+      - name: Checkout git repo
+        uses: actions/checkout@v3
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v2
@@ -26,7 +29,6 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
-#NEW: (START) ##########################################################
       - name: Build and export to Docker
         uses: docker/build-push-action@v4
         with:
@@ -38,11 +40,16 @@ jobs:
           # cache-to: type=gha,mode=max # avoid writing this (single arch amd64 image) to GitHub Actions cache, overwriting the previous entry (the multi arch image from the 'Docker Build and Push to Docker Hub' step) from a prior run of the workflow, because then in the 'Docker Build and Push to Docker Hub' step both arm 64 and 32 bit images (parts of the multi arch image that the step produces) need to be rebuilt instead of being taken from the GitHub Actions cache. The amd64 image built in the 'Build and export to Docker' step is available and doesn't need to be rebuilt in the 'Docker Build and Push to Docker Hub' step thanks to the Docker build cache (both steps use the same builder and are part of a single job/ run on the same runner).
           platforms: linux/amd64
 
-        # for simple tests (npm test, etc.) just run a local image in docker
-      - name: Unit Testing in Docker
+#NEW: (START) ############################################################  
+        # for more advanced tests, use docker compose with `depends_on`
+          # NOTE: GHA and other CIs can also run dependency containers on their own
+          # GHA `services:` can do this if you're trying to avoid docker compose
+      - name: Test healthcheck in Docker Compose
         run: |
-          docker run --rm ${{ github.run_id }} echo "run test commands here"
-#NEW: (END) ############################################################
+          export TESTING_IMAGE="${{ github.run_id }}"
+          docker compose -f docker-compose.test.yml up --exit-code-from sut
+#NEW: (END) ############################################################  
+
 
       - name: Docker Metadata for Final Image Build
         id: docker_meta
@@ -52,7 +59,7 @@ jobs:
           flavor: |
             latest=false
           tags: |
-            type=raw,value=08
+            type=raw,value=09
           # comment these out on all but 04-add-metadata.yaml to avoid overwriting image tags
           # type=raw,value=latest,enable=${{ endsWith(github.ref, github.event.repository.default_branch) }}
           # type=ref,event=pr
