@@ -1,5 +1,5 @@
 ---
-name: 04 Build with Metadata
+name: 06 Build and Scan
 
 on:
   push:
@@ -11,8 +11,8 @@ jobs:
   build-image:
     name: Build Images
     runs-on: ubuntu-latest
+    
     steps:
-
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v2
@@ -26,8 +26,27 @@ jobs:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
 
+      - name: Build and export to Docker
+        uses: docker/build-push-action@v4
+        with:
+          push: false
+          load: true # Export to Docker Engine rather than pushing to a registry
+          tags: ${{ github.run_id }}
+          # target: test # in Bret's examples this refers to a stage in his multi-stage dockerfile he has in his example repo, where as the one here is simple (not a multi-stage dockerfile) 
+          cache-from: type=gha
+          # cache-to: type=gha,mode=max # avoid writing this (single arch amd64 image) to GitHub Actions cache, overwriting the previous entry (the multi arch image from the 'Docker Build and Push to Docker Hub' step) from a prior run of the workflow, because then in the 'Docker Build and Push to Docker Hub' step both arm 64 and 32 bit images (parts of the multi arch image that the step produces) need to be rebuilt instead of being taken from the GitHub Actions cache. The amd64 image built in the 'Build and export to Docker' step is available and doesn't need to be rebuilt in the 'Docker Build and Push to Docker Hub' step thanks to the Docker build cache (both steps use the same builder and are part of a single job/ run on the same runner).
+          platforms: linux/amd64
+
 #NEW: (START) ##########################################################
-      - name: Docker meta
+      - name: Run Trivy for all CVEs (non-blocking)
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ github.run_id }}
+          exit-code: 0
+          format: table 
+#NEW: (END) ############################################################
+
+      - name: Docker Metadata for Final Image Build
         id: docker_meta
         uses: docker/metadata-action@v4
         with:
@@ -35,21 +54,19 @@ jobs:
           flavor: |
             latest=false
           tags: |
-            type=raw,value=04
-            type=raw,value=latest,enable=${{ endsWith(github.ref, github.event.repository.default_branch) }}
-            type=ref,event=pr
-            type=ref,event=branch
-            type=semver,pattern={{version}}
-#NEW: (END) ############################################################
+            type=raw,value=06
+          # comment these out on all but 04-add-metadata.yaml to avoid overwriting image tags
+          # type=raw,value=latest,enable=${{ endsWith(github.ref, github.event.repository.default_branch) }}
+          # type=ref,event=pr
+          # type=ref,event=branch
+          # type=semver,pattern={{version}}
       
-      - name: Docker build
+      - name: Docker Build and Push to Docker Hub
         uses: docker/build-push-action@v4
         with:
-#NEW: (START) ##########################################################
           push: true
           tags: ${{ steps.docker_meta.outputs.tags }}
           labels: ${{ steps.docker_meta.outputs.labels }}
-#NEW: (END) ############################################################
           cache-from: type=gha
           cache-to: type=gha,mode=max
           platforms: linux/amd64,linux/arm64,linux/arm/v7
